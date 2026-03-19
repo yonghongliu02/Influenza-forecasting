@@ -1,0 +1,201 @@
+"""
+catboost model train and predict
+Yearly rolling 
+
+"""
+
+## import package
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import warnings
+import xgboost
+import catboost as cb  # 导入catboost
+warnings.filterwarnings('ignore')
+import random
+import copy
+import os
+import sys
+# 获取当前工作目录
+current_dir = os.getcwd()
+# 获取上一层目录
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(parent_dir)
+from datetime import datetime,timedelta
+from model.MLModel import CatBoostModel, MLDataset
+from tools.data import DataTool
+from tools.plot import Plot_
+############################################### preparation ##########################################
+model_name = 'CB_rolling'
+mode = 'test8_2023'
+#test_start_date = '2005-11-01'
+#test_end_date = None#'2016-06-30'
+
+start_time = datetime.now()
+
+#data路径
+pwd=os.path.abspath(os.path.dirname(os.getcwd()))
+origin_path=os.path.abspath(os.path.join(pwd, '..'))
+path = pwd + '/Data/rolling_data_before1022.parquet'
+
+##预测变量
+col_list = ['mean_temperature','rh', 
+                      'monthid', 'weekid', 'rate', 'date_analysis']
+dr = DataTool()
+df_o = dr.data_output(path, col_list, mode = 'log')
+
+#转换为时间格式
+df_o['date_analysis'] = pd.to_datetime(df_o['date_analysis'])
+#赋值数据集
+df = copy.deepcopy(df_o)
+print("finally, start date = ", df.index.min())
+# 筛选出最新日期的行，并删除 'date_analysis' 列
+df_all = df.loc[df['date_analysis'] == max(df['date_analysis']),].drop('date_analysis', axis = 1)
+
+############################################### fit and predict ##########################################
+pred_stamp = 9
+exp_mode = True
+cov_list = ['mean_temperature','rh']
+
+def cv_param(df, random_state, test_start, pred_horizon):
+    """ 
+    first, update the parameter
+    second, fit model and make prediction
+    -----------------------------------------
+    """
+    #设置种子
+    np.random.seed(random_state)
+    random.seed(random_state)
+    
+    #找到训练数据的结束日期
+    train_analysis_end = max([date_ for date_ in df.date_analysis.unique() 
+                              if date_ <= test_start])
+    # print("train_analysis_end = ", train_analysis_end)
+    
+    #从 df 中选择出日期为 train_analysis_end 的行，作为训练集。并删除 date_analysis 列，因为它是日期数据，不是模型输入特征。
+    df_train = copy.deepcopy(df.loc[df.date_analysis == train_analysis_end,:])
+    df_train = df_train.drop('date_analysis', axis = 1)
+    # print("df_train.shape = ", df_train.shape)
+    
+    mycat = CatBoostModel()
+    data_deal = MLDataset()
+    # 1. -------------------- get the best parameter ------------
+    ### train data prepare
+    train_datadict, _ = data_deal.get_train_data(df_train, 
+                                                 max_rate_lag=14,
+                                                 cov_list = cov_list, 
+                                                 max_cov_lag=14, 
+                                                 pred_horizon = pred_horizon, 
+                                                 validation=False)
+    x_train, y_train = train_datadict['x_data'], train_datadict['y_data']
+    # print(x_train.shape, y_train.shape)
+    # CatBoost模型的超参数网格
+    params = {
+      'iterations': [100, 200, 300],  # 树的个数
+      'depth': [3, 5, 7, 9],  # 树的深度
+      'learning_rate': [0.01, 0.05, 0.1, 0.2],  # 学习率
+      'l2_leaf_reg': [1, 3, 5, 7],  # L2正则化
+      'random_seed': [random_state],  # 随机种子
+      'verbose': [False],  # 不输出训练信息
+      'allow_writing_files': [False]  # 不写入文件
+    }
+  
+    mycat.CV_train_(x_train, y_train, fold_num = 5, param_dict = params)
+  
+
+    return mycat, data_deal, train_datadict
+
+def fit_and_predict(df, model, data_deal, train_datadict, pred_start, pred_end, pred_horizon, random_state):
+    #设种子
+    np.random.seed(random_state)
+    random.seed(random_state)
+    
+    # re fit with sampling 
+    x_train, y_train = train_datadict['x_data'].values, train_datadict['y_data'].values
+    train_ind = np.random.choice(x_train.shape[0], size=x_train.shape[0], replace=True)
+    x_train,y_train = x_train[train_ind,:],y_train[train_ind,:]
+    model.fit_(x_train, y_train, random_state)
+   
+    # test data preparation
+    max_lag = data_deal.output_max_lag()
+    test_start_date = pred_start+timedelta(days=-int(7*max_lag))
+    test_end_date = pred_end#+timedelta(days = (pred_horizon-1) * 7)
+    # print("for generating predict data, start date = ",test_start_date,", end date = ",test_end_date )
+    
+    #预测区间
+    df_test_o = df.loc[(df.index >= test_start_date) & (df.index <= test_end_date),:]
+    # print("df_test_origin shape = ", df_test_o.shape, ", min date = ", df_test_o.index.min(),", max_date = ", df_test_o.index.max())
+    df_test= data_deal.get_test_data(df_test_o)
+    # print("for df_test, min = ", df_test.index.min(),", max = ",df_test.index.max())
+    x_test, y_test = df_test.iloc[:,0:-pred_horizon].values, df_test.iloc[:,-pred_horizon:].values
+    # print(x_test.shape, y_test.shape)
+    # make prediction
+    y_test_hat = model.predict_(x_test)
+    #反归一化处理
+    rate_max, rate_min = data_deal.output_rate_scaler()
+    y_test, y_test_hat = y_test*(rate_max - rate_min)+rate_min , y_test_hat*(rate_max - rate_min)+rate_min 
+    y_test, y_test_hat = np.exp(y_test), np.exp(y_test_hat)
+    return y_test, y_test_hat
+
+
+#生成滚动日期
+test_start_date = pd.to_datetime('2023-07-03')
+max_year_range = 15
+year_step = 1
+rolling_dates = [test_start_date + 
+                 timedelta(days = 52 * 7 * i) 
+                 for i in range(0,max_year_range,year_step) 
+                 if test_start_date + timedelta(days = 52 * 7 * i) < (pd.to_datetime('2025-07-03')-timedelta(days = (pred_stamp-1) * 7))]
+
+rolling_dates
+#添加最终的滚动日期
+rolling_dates.append(pd.to_datetime('2025-07-03')-timedelta(days = (pred_stamp-1) * 7))
+#准备测试数据
+df_test_total = copy.deepcopy(df.loc[df.index >= test_start_date,:])
+#空数据框
+re_test_total = pd.DataFrame()
+# dr.origin_re_output(df_test, left_len=0, pred_len = pred_horizon, exp_mode=exp_mode)
+
+bootstrap_times = 1
+for i_date in range(len(rolling_dates)-1):
+    print("this prediction interval = ", rolling_dates[i_date], rolling_dates[i_date+1])
+    test_start, test_end = rolling_dates[i_date], rolling_dates[i_date+1]+timedelta(days = (pred_stamp-1) * 7)
+    #数据准备
+    df_t = copy.deepcopy(df_all.loc[df_all.index<=pd.to_datetime(test_end),:])
+    df_test = copy.deepcopy(df_t.loc[df_t.index >= test_start,:])
+    #生成预测数据并调用模型函数
+    re_test = dr.origin_re_output(df_test, left_len=0, pred_len = pred_stamp, exp_mode=exp_mode)
+    print("----------------------------- i_date = ", i_date,", test_start = ", test_start, ', test_end = ',test_end)
+    #使用交叉验证和参数调整
+    mymodel, data_deal, train_datadict = cv_param(df, random_state = i_date, test_start = test_start, pred_horizon = pred_stamp)
+   #使用 Bootstrap 重采样
+    for bst in range(bootstrap_times):
+        print("-------------------------- bootstrap = ", bst, " ----------------------------------")
+        y_true,y_pred = fit_and_predict(df_all, mymodel, data_deal, train_datadict, test_start, test_end, pred_stamp, random_state=i_date)
+        re_test_pred = pd.DataFrame()
+        for i in range(pred_stamp):
+            re_t = pd.DataFrame(y_pred[:,i], columns = [f'boot_{bst}'])
+            re_t['week_ahead'] = i
+            re_test_pred = pd.concat([re_test_pred, re_t], ignore_index=True)
+        re_test = pd.concat([re_test, re_test_pred[[f'boot_{bst}']]], axis=1)
+        #汇总所有的测试结果
+    re_test_total = pd.concat([re_test_total, re_test], axis=0)
+
+############################################### save ##########################################
+re_test_total.rename(columns={'boot_0':'point'}, inplace=True)
+#转换
+re_test_total['point'] = np.exp(re_test_total['point']) / 10
+re_test_total['true'] = np.exp(re_test_total['true']) / 10
+
+re_test_total['point_avg'] = re_test_total['point']
+
+dr.point_write(re = re_test_total, origin_path=pwd, mode = mode, model_name=model_name)
+
+end_time = datetime.now()
+print("at the time<",start_time.strftime('%Y-%m-%d %H:%M:%S'),">, ",model_name,
+      " begin,"," at the time<",end_time.strftime('%Y-%m-%d %H:%M:%S'),"> finished.") 
+print("The running time totally =", (end_time-start_time).seconds," seconds.") 
+
+
+
+
